@@ -25,6 +25,29 @@ from ..preprocessing import TimeSeriesScalerMinMax
 __author__ = 'Romain Tavenard romain.tavenard[at]univ-rennes2.fr'
 
 
+class GradientReversalLayer(Layer):
+    """
+    Gradient Reversal Layer (GRL) for enforcing constraints on shapelet learning.
+    In the forward pass, it passes the input unchanged.
+    In the backward pass, it reverses the gradient by multiplying with -λ.
+    """
+    def __init__(self, lambda_=1.0, **kwargs):
+        super().__init__(**kwargs)
+        self.lambda_ = lambda_
+
+    def call(self, inputs, **kwargs):
+        @tf.custom_gradient
+        def grad_reverse(x):
+            def grad(dy):
+                return -self.lambda_ * dy  # Reverse the gradient during backward pass
+            return x, grad
+        return grad_reverse(inputs)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({'lambda_': self.lambda_})
+        return config
+
 class GlobalMinPooling1D(Layer):
     """Global min pooling operation for temporal data.
     # Input shape
@@ -410,8 +433,31 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
             shapelets[i, :sz, :] = non_formatted_shapelets[i]
         return shapelets
 
-    def fit(self, X, y):
-        """Learn time-series shapelets.
+    def compute_shapelet_similarity_loss(self, X, lambda_=0.1):
+        """
+        Compute similarity loss between shapelets and input subsequences using GRL.
+        
+        Parameters
+        ----------
+        X : tf.Tensor
+            Input time series tensor (batch, steps, features).
+        lambda_ : float
+            Gradient reversal strength.
+        
+        Returns
+        -------
+        loss : tf.Tensor
+            Similarity loss.
+        """
+        shapelet_outputs = self.transformer_model_.predict(X, verbose=0)
+        grl_layer = GradientReversalLayer(lambda_=lambda_)
+        reversed_output = grl_layer(shapelet_outputs)
+        loss = tf.reduce_mean(tf.square(X - reversed_output))  # MSE between input and shapelet
+        return loss
+    
+    def fit(self, X, y, lambda_=0.1):
+        """
+        Learn time-series shapelets with GRL-based similarity constraint.
 
         Parameters
         ----------
@@ -419,7 +465,10 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
             Time series dataset.
         y : array-like of shape=(n_ts, )
             Time series labels.
+        lambda_ : float
+            Gradient reversal strength for shapelet similarity loss.
         """
+        # 데이터 전처리
         X, y = check_X_y(X, y, allow_nd=True, force_all_finite=False)
         X = self._preprocess_series(X)
         X = check_dims(X)
@@ -431,36 +480,51 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         n_ts, sz, d = X.shape
         self._X_fit_dims = X.shape
 
-        self.model_ = None
-        self.transformer_model_ = None
-        self.locator_model_ = None
-        self.d_ = d
-
         y_ = self._preprocess_labels(y)
         n_labels = len(self.classes_)
 
+        # Shapelet 크기 및 개수 설정
         if self.n_shapelets_per_size is None:
-            sizes = grabocka_params_to_shapelet_size_dict(n_ts,
-                                                          self._min_sz_fit,
-                                                          n_labels,
-                                                          self.shapelet_length,
-                                                          self.total_lengths)
+            sizes = grabocka_params_to_shapelet_size_dict(
+                n_ts, self._min_sz_fit, n_labels, self.shapelet_length, self.total_lengths)
             self.n_shapelets_per_size_ = sizes
         else:
             self.n_shapelets_per_size_ = self.n_shapelets_per_size
 
+        # 모델 구조 설정
         self._set_model_layers(X=X, ts_sz=sz, d=d, n_classes=n_labels)
         self._set_weights_false_conv(d=d)
-        h = self.model_.fit(
-            [X[:, :, di].reshape((n_ts, sz, 1)) for di in range(d)], y_,
-            batch_size=self.batch_size, epochs=self.max_iter,
-            verbose=self.verbose
-        )
-        self.history_ = h.history
-        self.n_iter_ = len(self.history_.get("loss", []))
-        # 추가: shapelet 위치 저장
-        self.shapelet_positions_ = self.locate_with_instances(X)
-        
+
+        # 옵티마이저 설정
+        optimizer = tf.keras.optimizers.Adam()
+
+        # 학습 루프
+        for epoch in range(self.max_iter):
+            with tf.GradientTape() as tape:
+                # 모델 예측 (Forward Pass)
+                y_pred = self.model_([X[:, :, di].reshape((n_ts, sz, 1)) for di in range(d)])
+                
+                # 분류 손실 (Categorical Cross-Entropy)
+                classification_loss = tf.reduce_mean(
+                    tf.keras.losses.categorical_crossentropy(y_, y_pred))
+                
+                # GRL 기반 shapelet 유사도 손실
+                grl_loss = self.compute_shapelet_similarity_loss(X, lambda_=lambda_)
+                
+                # 총 손실 = 분류 손실 + shapelet 유사도 손실
+                total_loss = classification_loss + grl_loss
+
+            # Backward Pass 및 가중치 업데이트
+            grads = tape.gradient(total_loss, self.model_.trainable_weights)
+            optimizer.apply_gradients(zip(grads, self.model_.trainable_weights))
+
+            # 손실 출력
+            if self.verbose > 0 and epoch % 10 == 0:
+                print(f"Epoch {epoch}, Total Loss: {total_loss.numpy():.4f}, "
+                    f"Classification Loss: {classification_loss.numpy():.4f}, "
+                    f"GRL Loss: {grl_loss.numpy():.4f}")
+
+        # 학습된 모델 객체 반환
         return self
 
     def predict(self, X):
