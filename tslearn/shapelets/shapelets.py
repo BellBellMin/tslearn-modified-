@@ -458,6 +458,9 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         )
         self.history_ = h.history
         self.n_iter_ = len(self.history_.get("loss", []))
+        # 추가: shapelet 위치 저장
+        self.shapelet_positions_ = self.locate_with_instances(X)
+        
         return self
 
     def predict(self, X):
@@ -593,6 +596,39 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         )
         return locations.astype(int)
 
+    def locate_with_instances(self, X):
+        """시계열 인스턴스 ID와 shapelet 위치 반환
+
+        Parameters
+        ----------
+        X : array-like of shape=(n_ts, sz, d)
+            Time series dataset.
+
+        Returns
+        -------
+        positions : list of tuples
+            각 shapelet이 어느 시계열과 인덱스에 위치하는지 저장된 리스트.
+            예: [(instance_id, start_index), ...]
+        """
+        check_is_fitted(self, '_X_fit_dims')
+        X = check_array(X, allow_nd=True, force_all_finite=False)
+        X = self._preprocess_series(X)
+        X = check_dims(X, X_fit_dims=self._X_fit_dims, check_n_features_only=True)
+        self._check_series_length(X)
+
+        n_ts, sz, d = X.shape
+        locations = self.locator_model_.predict(
+            [X[:, :, di].reshape((n_ts, sz, 1)) for di in range(self.d_)],
+            batch_size=self.batch_size, verbose=self.verbose
+        ).astype(int)
+
+        # 시계열 인스턴스와 shapelet 위치를 함께 기록
+        positions = []
+        for instance_id in range(n_ts):
+            for shapelet_idx, start_index in enumerate(locations[instance_id]):
+                positions.append((instance_id, shapelet_idx, start_index))
+        return positions
+    
     def _check_series_length(self, X):
         """Ensures that time series in X matches the following requirements:
         
