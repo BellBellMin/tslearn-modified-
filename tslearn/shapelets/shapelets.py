@@ -12,41 +12,26 @@ from sklearn.utils.multiclass import unique_labels
 from tensorflow.keras.regularizers import l2
 from tensorflow.keras.initializers import Initializer
 import tensorflow.keras.backend as K
-import numpy
+import numpy as np
 import tensorflow as tf
+tf.config.run_functions_eagerly(True)  # Eager Execution 활성화
+from tensorflow.keras.layers import Lambda
+from tensorflow.keras.initializers import RandomUniform
 
 import warnings
 
-from ..utils import to_time_series_dataset, check_dims, ts_size
-from ..bases import BaseModelPackage, TimeSeriesBaseEstimator
-from ..clustering import TimeSeriesKMeans
-from ..preprocessing import TimeSeriesScalerMinMax
+from tslearn.utils import to_time_series_dataset, check_dims, ts_size
+from tslearn.bases import BaseModelPackage, TimeSeriesBaseEstimator
+from tslearn.clustering import TimeSeriesKMeans
+from tslearn.preprocessing import TimeSeriesScalerMinMax
+
+# from ..utils import to_time_series_dataset, check_dims, ts_size
+# from ..bases import BaseModelPackage, TimeSeriesBaseEstimator
+# from ..clustering import TimeSeriesKMeans
+# from ..preprocessing import TimeSeriesScalerMinMax
 
 __author__ = 'Romain Tavenard romain.tavenard[at]univ-rennes2.fr'
 
-
-class GradientReversalLayer(Layer):
-    """
-    Gradient Reversal Layer (GRL) for enforcing constraints on shapelet learning.
-    In the forward pass, it passes the input unchanged.
-    In the backward pass, it reverses the gradient by multiplying with -λ.
-    """
-    def __init__(self, lambda_=1.0, **kwargs):
-        super().__init__(**kwargs)
-        self.lambda_ = lambda_
-
-    def call(self, inputs, **kwargs):
-        @tf.custom_gradient
-        def grad_reverse(x):
-            def grad(dy):
-                return -self.lambda_ * dy  # Reverse the gradient during backward pass
-            return x, grad
-        return grad_reverse(inputs)
-
-    def get_config(self):
-        config = super().get_config()
-        config.update({'lambda_': self.lambda_})
-        return config
 
 class GlobalMinPooling1D(Layer):
     """Global min pooling operation for temporal data.
@@ -58,9 +43,9 @@ class GlobalMinPooling1D(Layer):
         
     Examples
     --------
-    >>> x = tf.constant([5.0, numpy.nan, 6.8, numpy.nan, numpy.inf])
+    >>> x = tf.constant([5.0, np.nan, 6.8, np.nan, np.inf])
     >>> x = tf.reshape(x, [1, 5, 1])
-    >>> GlobalMinPooling1D()(x).numpy()
+    >>> GlobalMinPooling1D()(x).np()
     array([[5.]], dtype=float32)
     """
 
@@ -74,7 +59,7 @@ class GlobalMinPooling1D(Layer):
     def call(self, inputs, **kwargs):
         inputs_without_nans = tf.where(tf.math.is_finite(inputs),
                                        inputs,
-                                       tf.zeros_like(inputs) + numpy.inf)
+                                       tf.zeros_like(inputs) + np.inf)
         return tf.reduce_min(inputs_without_nans, axis=1)
 
 
@@ -100,12 +85,12 @@ class GlobalArgminPooling1D(Layer):
 
 def _kmeans_init_shapelets(X, n_shapelets, shp_len, n_draw=10000):
     n_ts, sz, d = X.shape
-    indices_ts = numpy.random.choice(n_ts, size=n_draw, replace=True)
-    indices_time = numpy.array(
-        [numpy.random.choice(ts_size(ts) - shp_len + 1, size=1)[0]
+    indices_ts = np.random.choice(n_ts, size=n_draw, replace=True)
+    indices_time = np.array(
+        [np.random.choice(ts_size(ts) - shp_len + 1, size=1)[0]
          for ts in X[indices_ts]]
     )
-    subseries = numpy.zeros((n_draw, shp_len, d))
+    subseries = np.zeros((n_draw, shp_len, d))
     for i in range(n_draw):
         subseries[i] = X[indices_ts[i],
                          indices_time[i]:indices_time[i] + shp_len]
@@ -114,68 +99,455 @@ def _kmeans_init_shapelets(X, n_shapelets, shp_len, n_draw=10000):
                             verbose=False).fit(subseries).cluster_centers_
 
 
-class KMeansShapeletInitializer(Initializer):
-    """Initializer that generates shapelet tensors based on a clustering of
-    time series snippets.
-
-    # Arguments
-        dataset: a dataset of time series.
+def locate_with_instances(self, X):
     """
-    def __init__(self, X):
-        self.X_ = to_time_series_dataset(X)
+    각 shapelet이 어느 시계열 인스턴스에서 시작되었는지 위치 반환
 
-    def __call__(self, shape, dtype=None):
-        n_shapelets, shp_len = shape
-        shapelets = _kmeans_init_shapelets(self.X_,
-                                           n_shapelets,
-                                           shp_len)[:, :, 0]
-        return tf.convert_to_tensor(shapelets, dtype=K.floatx())
+    Parameters
+    ----------
+    X : array-like of shape=(n_ts, sz, d)
+        입력 시계열 데이터.
 
-    def get_config(self):
-        return {'data': self.X_}
+    Returns
+    -------
+    positions : list of tuples
+        각 shapelet이 어느 시계열과 인덱스에 위치하는지를 반환.
+        형식: [(instance_id, shapelet_id, start_index), ...]
+    """
+    # 학습된 모델 확인
+    check_is_fitted(self, '_X_fit_dims')
+    
+    # 입력 데이터 전처리
+    X = check_array(X, allow_nd=True, force_all_finite=False)
+    X = self._preprocess_series(X)
+    X = check_dims(X, X_fit_dims=self._X_fit_dims, check_n_features_only=True)
+    self._check_series_length(X)
 
+    n_ts, sz, d = X.shape
+    
+    # 각 차원에 대해 shapelet 위치 예측
+    locations = self.locator_model_.predict(
+        [X[:, :, di].reshape((n_ts, sz, 1)) for di in range(self.d_)],
+        batch_size=self.batch_size, verbose=self.verbose
+    ).astype(int)  # 정수형으로 변환
+
+    # 위치 정보 추출
+    positions = []
+    for instance_id in range(n_ts):
+        for shapelet_idx, start_index in enumerate(locations[instance_id]):
+            positions.append((instance_id, shapelet_idx, start_index))
+
+    return positions
+
+# def random_shapelet_initializer(X, n_shapelets, shp_len, alpha_similarity=0.5):
+#     """
+#     랜덤 Shapelet 초기화 + 유사성 제약 적용.
+#     Parameters:
+#         X : ndarray
+#             입력 시계열 데이터.
+#         n_shapelets : int
+#             초기화할 shapelet 개수.
+#         shp_len : int
+#             shapelet 길이.
+#         alpha_similarity : float
+#             유사성 제약 (0 ~ 1 사이값).
+#     Returns:
+#         shapelets : ndarray
+#             초기화된 shapelet.
+#     """
+#     n_ts, sz, d = X.shape
+#     shapelets = []
+
+#     for _ in range(n_shapelets):
+#         # 랜덤 시계열 및 위치 선택
+#         ts_idx = np.random.choice(n_ts)
+#         start = np.random.randint(0, sz - shp_len)
+#         candidate = X[ts_idx, start:start + shp_len, :]
+
+#         # 유사성 제약 적용: 기존 shapelet과 겹치는 부분 방지
+#         if shapelets:
+#             min_dist = np.min([np.linalg.norm(candidate - shp) for shp in shapelets])
+#             if min_dist < alpha_similarity:
+#                 continue
+
+#         shapelets.append(candidate)
+
+#     return np.array(shapelets)
+
+def random_dilated_shapelet_initializer(X, n_shapelets, shp_len, dilation_range=(1, 5), alpha_similarity=0.5):
+    """랜덤 Dilation Shapelet 초기화 + 유사성 제약 적용 + 위치 및 dilation 정보 반환."""
+    n_ts, sz, d = X.shape
+    shapelets = []
+    dilations = []
+    positions = []
+
+    for _ in range(n_shapelets):
+        for _attempt in range(10):
+            # Dilation Rate 무작위 선택
+            dilation_rate = np.random.randint(dilation_range[0], min(dilation_range[1] + 1, sz // shp_len))
+            max_start = sz - dilation_rate * shp_len
+            if max_start <= 0:
+                continue
+
+            # 랜덤 시계열과 위치 선택
+            ts_idx = np.random.choice(n_ts)
+            start = np.random.randint(0, max_start + 1)
+
+            # dilation을 적용해 shapelet 추출
+            candidate = X[ts_idx, start:start + dilation_rate * shp_len:dilation_rate, :]
+
+            # shapelet을 TensorFlow Variable로 선언
+            shapelet = tf.Variable(candidate, dtype=tf.float32, trainable=True)
+
+            # 유사성 제약 확인
+            if shapelets:
+                min_dist = tf.reduce_min([tf.norm(shapelet - shp) for shp in shapelets])
+                if min_dist < alpha_similarity:
+                    continue
+
+            # 유효한 shapelet 저장
+            shapelets.append(shapelet)
+            dilations.append(dilation_rate)
+            positions.append((ts_idx, start, dilation_rate))
+            break
+
+    return shapelets, dilations, positions
+
+# def random_dilated_shapelet_initializer(X, n_shapelets, shp_len, dilation_range=(1, 5), alpha_similarity=0.5):
+#     """
+#     랜덤 Dilation Shapelet 초기화 + 유사성 제약 적용 + 위치 및 dilation 정보 반환.
+#     """
+#     n_ts, sz, d = X.shape
+#     shapelets = []
+#     dilations = []
+#     positions = []  # (instance_id, start_index, dilation)
+
+#     for _ in range(n_shapelets):
+#         attempt = 0  # 유효한 shapelet 찾기 시도 횟수
+#         while attempt < 10:  # 최대 10번 시도
+#             # 랜덤 Dilation Rate 생성 (유효한 값만)
+#             dilation_rate = np.random.randint(dilation_range[0], min(dilation_range[1] + 1, sz // shp_len))
+#             max_start = sz - dilation_rate * shp_len
+
+#             if max_start <= 0:
+#                 attempt += 1
+#                 continue
+
+#             # 랜덤 시계열 및 위치 선택
+#             ts_idx = np.random.choice(n_ts)
+#             start = np.random.randint(0, max_start + 1)
+#             candidate = X[ts_idx, start:start + dilation_rate * shp_len:dilation_rate, :]
+
+#             # 유사도 제약 적용
+#             if shapelets:
+#                 min_dist = np.min([np.linalg.norm(candidate - shp) for shp in shapelets])
+#                 if min_dist < alpha_similarity:  # 유사도 제약 만족 여부 확인
+#                     attempt += 1
+#                     continue
+
+#             # 유효한 shapelet 저장
+#             shapelets.append(candidate)
+#             dilations.append(dilation_rate)
+#             positions.append((ts_idx, start, dilation_rate))
+#             break
+
+#         if attempt >= 10:
+#             print(f"경고: 유효한 shapelet을 찾지 못함 (shapelet 길이: {shp_len}, dilation 범위: {dilation_range})")
+
+#     return np.array(shapelets), dilations, positions
+
+# def random_dilated_shapelet_initializer(X, n_shapelets, shp_len, dilation_range=(1, 5), alpha_similarity=0.5):
+#     """
+#     랜덤 Dilation Shapelet 초기화 + 유사성 제약 적용 + 위치 및 dilation 정보 반환.
+#     """
+#     n_ts, sz, d = X.shape
+#     shapelets = []
+#     dilations = []
+#     positions = []  # (instance_id, start_index, dilation)
+
+#     for _ in range(n_shapelets):
+#         attempt = 0  # 유효한 shapelet 찾기 시도 횟수
+#         while attempt < 10:  # 최대 10번 시도
+#             # 랜덤 Dilation Rate 생성 (유효한 값만)
+#             dilation_rate = np.random.randint(dilation_range[0], min(dilation_range[1] + 1, sz // shp_len))
+            
+#             # 유효한 start 범위 확인
+#             max_start = sz - dilation_rate * shp_len
+#             if max_start <= 0:
+#                 attempt += 1
+#                 continue  # 유효하지 않은 경우 다시 시도
+            
+#             # 랜덤 시계열 및 위치 선택
+#             ts_idx = np.random.choice(n_ts)
+#             start = np.random.randint(0, max_start + 1)
+            
+#             # Dilation 적용
+#             candidate = X[ts_idx, start:start + dilation_rate * shp_len:dilation_rate, :]
+            
+#             # 유사성 제약 적용
+#             if shapelets:
+#                 min_dist = np.min([np.linalg.norm(candidate - shp) for shp in shapelets])
+#                 if min_dist < alpha_similarity:
+#                     attempt += 1
+#                     continue
+            
+#             # 유효한 shapelet 저장
+#             shapelets.append(candidate)
+#             dilations.append(dilation_rate)
+#             positions.append((ts_idx, start, dilation_rate))
+#             break  # 성공하면 루프 종료
+        
+#         if attempt >= 10:
+#             print(f"경고: 유효한 shapelet을 찾지 못함 (shapelet 길이: {shp_len}, dilation 범위: {dilation_range})")
+    
+#     return np.array(shapelets), dilations, positions
+
+def pad_shapelets(shapelets, padding_value=0.0):
+    """
+    Pads shapelets to ensure they all have the same length and dtype=tf.float32.
+
+    Parameters
+    ----------
+    shapelets : list of tf.Tensor or tf.Variable
+        List of shapelets with varying lengths.
+    padding_value : float, optional
+        Value used for padding. Default is 0.0.
+
+    Returns
+    -------
+    tf.Tensor
+        A padded 3D tensor of shapelets (n_shapelets, max_length, n_features), dtype=float32.
+    """
+    # Determine the maximum length of any shapelet
+    max_len = max(s.shape[0] for s in shapelets)
+    n_shapelets = len(shapelets)
+    n_features = shapelets[0].shape[-1]  # Number of features per shapelet
+
+    # Initialize a padded tensor with float32 type
+    padded_shapelets = tf.fill([n_shapelets, max_len, n_features], tf.cast(padding_value, tf.float32))
+
+    # Copy each shapelet into the padded tensor
+    for i, shp in enumerate(shapelets):
+        shp_float32 = tf.cast(shp, tf.float32)  # Ensure the shapelet is float32
+        len_shp = tf.shape(shp_float32)[0]
+        padded_shapelets = tf.tensor_scatter_nd_update(
+            padded_shapelets, 
+            indices=[[i]], 
+            updates=[tf.pad(shp_float32, [[0, max_len - len_shp], [0, 0]])]
+        )
+    
+    return padded_shapelets
+
+
+def shape_matching_loss(y_true, y_pred, shapelets, beta=0.1):
+    ce_loss = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+
+    # 패딩된 shapelets을 가져오기
+    padded_shapelets = pad_shapelets(shapelets)
+    
+    # 학습 가능한 변수 상태 유지
+    shapelets_tensor = tf.Variable(padded_shapelets, dtype=tf.float32, trainable=True)
+    
+    # Shapelet Norms 계산
+    shapelet_norms = tf.reduce_mean(
+        tf.square(shapelets_tensor - tf.reduce_mean(shapelets_tensor, axis=1, keepdims=True))
+    )
+    return ce_loss + beta * shapelet_norms
+
+# def shape_matching_loss(y_true, y_pred, shapelets, beta=0.1):
+#     """Shape Matching Loss 적용."""
+#     ce_loss = tf.keras.losses.categorical_crossentropy(y_true, y_pred)
+
+#     # 패딩 처리된 shapelets 가져오기
+#     padded_shapelets = pad_shapelets(shapelets)
+    
+#     # 명시적 텐서 변환
+#     shapelets_tensor = tf.convert_to_tensor(padded_shapelets, dtype=tf.float32)
+    
+#     # Shapelet Norms 계산
+#     shapelet_norms = tf.reduce_mean(
+#         tf.square(shapelets_tensor - tf.reduce_mean(shapelets_tensor, axis=1, keepdims=True))
+#     )
+#     return ce_loss + beta * shapelet_norms
 
 class LocalSquaredDistanceLayer(Layer):
-    """Pairwise (squared) distance computation between local patches and
-    shapelets
-
-    # Input shape
-        3D tensor with shape: `(batch_size, steps, features)`.
-    # Output shape
-        3D tensor with shape:
-        `(batch_size, steps, n_shapelets)`
-    """
-    def __init__(self, n_shapelets, X=None, **kwargs):
-        self.n_shapelets = n_shapelets
-        if X is None:
-            self.initializer = "uniform"
-        else:
-            self.initializer = KMeansShapeletInitializer(X)
+    """Pairwise (squared) distance computation between local patches and dilated shapelets."""
+    def __init__(self, n_shapelets, kernel_size, proba_norm=0.5, **kwargs):
         super().__init__(**kwargs)
-        self.input_spec = InputSpec(ndim=3)
+        self.n_shapelets = n_shapelets
+        self.kernel_size = kernel_size
+        self.proba_norm = proba_norm  # Z-정규화를 적용할 확률
 
     def build(self, input_shape):
-        self.kernel = self.add_weight(name='kernel',
-                                      shape=(self.n_shapelets, input_shape[2]),
-                                      initializer=self.initializer,
-                                      trainable=True)
+        # Shapelet 가중치를 학습 가능한 변수로 선언
+        self.kernel = self.add_weight(
+            name="kernel",
+            shape=(self.n_shapelets, self.kernel_size, input_shape[-1]),
+            initializer=RandomUniform(minval=-0.05, maxval=0.05),
+            trainable=True  # 자동으로 gradient 계산
+        )
+        
+        # Norm mask 초기화
+        self.norm_mask = self.add_weight(
+            name='norm_mask',
+            shape=(self.n_shapelets, 1),
+            initializer=tf.keras.initializers.Constant(value=1.0),
+            trainable=False
+        )
         super().build(input_shape)
 
-    def call(self, x, **kwargs):
-        # (x - y)^2 = x^2 + y^2 - 2 * x * y
-        x_sq = K.expand_dims(K.sum(x ** 2, axis=2), axis=-1)
-        y_sq = K.reshape(K.sum(self.kernel ** 2, axis=1),
-                         (1, 1, self.n_shapelets))
-        xy = K.dot(x, K.transpose(self.kernel))
-        return (x_sq + y_sq - 2 * xy) / K.int_shape(self.kernel)[1]
+    def call(self, x):
+        # Z-정규화된 입력값
+        x_mean = tf.reduce_mean(x, axis=1, keepdims=True)
+        x_std = tf.math.reduce_std(x, axis=1, keepdims=True) + 1e-8
+        x_norm = (x - x_mean) / x_std
+
+        # 입력 패치 생성
+        x_expanded = tf.expand_dims(x_norm, axis=-1)
+        patches = tf.image.extract_patches(
+            x_expanded,
+            sizes=[1, self.kernel_size, 1, 1],
+            strides=[1, 1, 1, 1],
+            rates=[1, 1, 1, 1],
+            padding="VALID"
+        )
+        patches = tf.reshape(patches, (-1, tf.shape(patches)[1], self.kernel_size, x.shape[-1]))
+
+        # Kernel을 Z-정규화
+        kernel_mean = tf.reduce_mean(self.kernel, axis=[1, 2], keepdims=True)
+        kernel_std = tf.math.reduce_std(self.kernel, axis=[1, 2], keepdims=True) + 1e-8
+        kernel_norm = (self.kernel - kernel_mean) / kernel_std
+
+        # 패치와 Kernel 차원 맞춤
+        kernel_expanded = tf.expand_dims(kernel_norm, axis=0)
+        kernel_expanded = tf.expand_dims(kernel_expanded, axis=1)
+        patches_expanded = tf.expand_dims(patches, axis=2)
+
+        # L2 거리 계산
+        distances = tf.reduce_sum(tf.square(patches_expanded - kernel_expanded), axis=-1)
+        distances = tf.reduce_min(distances, axis=2)
+        
+        return distances
 
     def compute_output_shape(self, input_shape):
-        return input_shape[0], input_shape[1], self.n_shapelets
+        return (input_shape[0], self.n_shapelets)
 
     def get_config(self):
-        config = {'n_shapelets': self.n_shapelets}
-        base_config = super().get_config()
-        return dict(list(base_config.items()) + list(config.items()))
+        config = super().get_config()
+        config.update({
+            "n_shapelets": self.n_shapelets,
+            "kernel_size": self.kernel_size,
+            "proba_norm": self.proba_norm
+        })
+        return config
+    
+# class LocalSquaredDistanceLayer(Layer):
+#     """
+#     Pairwise (squared) distance computation between local patches and dilated shapelets
+#     with probabilistic Z-normalization.
+#     """
+#     def __init__(self, n_shapelets, kernel_size, proba_norm=0.5, **kwargs):
+#         super().__init__(**kwargs)
+#         self.n_shapelets = n_shapelets
+#         self.kernel_size = kernel_size
+#         self.proba_norm = proba_norm  # Z-정규화를 적용할 확률
+
+#     def build(self, input_shape):
+        
+#         self.kernel = tf.convert_to_tensor(
+#         self.add_weight(
+#         name="kernel",
+#         shape=(self.n_shapelets, self.kernel_size, input_shape[-1]),
+#         initializer=RandomUniform(minval=-0.05, maxval=0.05),
+#         trainable=True  # 자동으로 gradient 계산
+#         ),
+#         dtype=tf.float32
+#         )
+        
+#         # ### 1트 ###
+#         # self.kernel = self.add_weight(
+#         # name="kernel",
+#         # shape=(self.n_shapelets, self.kernel_size, input_shape[-1]),
+#         # initializer=RandomUniform(minval=-0.05, maxval=0.05),
+#         # trainable=True  # 명확히 trainable=True 설정
+#         # )
+        
+#         # # Kernel 초기화
+#         # self.kernel = tf.Variable(
+#         #     self.add_weight(
+#         #         name="kernel",
+#         #         shape=(self.n_shapelets, self.kernel_size, input_shape[-1]),
+#         #         initializer=RandomUniform(minval=-0.05, maxval=0.05),
+#         #         trainable=True
+#         #     ), dtype=tf.float32
+#         # )
+
+#         if not isinstance(self.kernel, (tf.Variable, tf.Tensor)):
+#             raise TypeError(f"self.kernel must be a tf.Variable or tf.Tensor, got {type(self.kernel)} instead.")
+
+#         # Norm mask 초기화
+#         self.norm_mask = self.add_weight(
+#             name='norm_mask',
+#             shape=(self.n_shapelets, 1),
+#             initializer=tf.keras.initializers.Constant(value=1.0),
+#             trainable=False
+#         )
+
+#         super().build(input_shape)
+
+#     def call(self, x):
+
+#         # Z-정규화된 입력값
+#         x_mean = K.mean(x, axis=1, keepdims=True)
+#         x_std = K.std(x, axis=1, keepdims=True) + 1e-8
+#         x_norm = (x - x_mean) / x_std
+
+#         # 입력을 4차원으로 확장
+#         x_expanded = tf.expand_dims(x_norm, axis=-1)  # shape=(batch_size, time_steps, features, 1)
+
+#         # Z-정규화된 Kernel
+#         kernel_mean = K.mean(self.kernel, axis=[1, 2], keepdims=True)
+#         kernel_std = K.std(self.kernel, axis=[1, 2], keepdims=True) + 1e-8
+#         kernel_norm = (self.kernel - kernel_mean) / kernel_std
+
+#         # 패치 추출
+#         patches = tf.image.extract_patches(
+#             x_expanded, 
+#             sizes=[1, self.kernel_size, 1, 1], 
+#             strides=[1, 1, 1, 1], 
+#             rates=[1, 1, 1, 1], 
+#             padding='VALID'
+#         )
+
+#         # 패치 shape 조정 (정확한 차원 재조정)
+#         batch_size = tf.shape(patches)[0]
+#         n_patches = tf.shape(patches)[1]
+#         patches = tf.reshape(patches, (batch_size, n_patches, self.kernel_size, x.shape[-1]))
+
+#         # kernel_norm을 patches와 동일한 차원으로 확장
+#         kernel_norm_expanded = tf.expand_dims(kernel_norm, axis=0)  # (1, n_shapelets, kernel_size, features)
+#         kernel_norm_expanded = tf.expand_dims(kernel_norm_expanded, axis=1)  # (1, 1, n_shapelets, kernel_size, features)
+
+#         # patches의 차원을 맞춤
+#         patches_expanded = tf.expand_dims(patches, axis=2)  # (batch_size, n_patches, 1, kernel_size, features)
+
+#         # L2 거리 계산
+#         distances = tf.reduce_sum(tf.square(patches_expanded - kernel_norm_expanded), axis=-1)
+#         distances = tf.reduce_min(distances, axis=2)  # 가장 가까운 shapelet과의 거리 계산
+
+#         return distances
+
+#     def compute_output_shape(self, input_shape):
+#         return (input_shape[0], self.n_shapelets)
+
+#     def get_config(self):
+#         config = super().get_config()
+#         config.update({
+#             "n_shapelets": self.n_shapelets,
+#             "kernel_size": self.kernel_size,
+#             "proba_norm": self.proba_norm
+#         })
+#         return config
 
 
 def grabocka_params_to_shapelet_size_dict(n_ts, ts_sz, n_classes, l, r):
@@ -224,7 +596,7 @@ def grabocka_params_to_shapelet_size_dict(n_ts, ts_sz, n_classes, l, r):
     d = {}
     for sz_idx in range(r):
         shp_sz = base_size * (sz_idx + 1)
-        n_shapelets = int(numpy.log10(n_ts *
+        n_shapelets = int(np.log10(n_ts *
                                       (ts_sz - shp_sz + 1) *
                                       (n_classes - 1)))
         n_shapelets = max(1, n_shapelets)
@@ -308,10 +680,10 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
 
     Attributes
     ----------
-    shapelets_ : numpy.ndarray of objects, each object being a time series
+    shapelets_ : np.ndarray of objects, each object being a time series
         Set of time-series shapelets.
 
-    shapelets_as_time_series_ : numpy.ndarray of shape (n_shapelets, sz_shp, d) where `sz_shp` is the maximum of all shapelet sizes
+    shapelets_as_time_series_ : np.ndarray of shape (n_shapelets, sz_shp, d) where `sz_shp` is the maximum of all shapelet sizes
         Set of time-series shapelets formatted as a ``tslearn`` time series
         dataset.
 
@@ -358,6 +730,8 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
                  weight_regularizer=0.,
                  shapelet_length=0.15,
                  total_lengths=3,
+                 alpha_similarity=0.5,  # 유사도 제약 하이퍼파라미터
+                 beta=0.1, # Norm loss의 가중치 하이퍼파라미터
                  max_size=None,
                  scale=False,
                  random_state=None):
@@ -372,6 +746,9 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         self.max_size = max_size
         self.scale = scale
         self.random_state = random_state
+        self.alpha_similarity = alpha_similarity  # 저장
+        self.beta = beta                          # 저장
+
 
         if not scale:
             warnings.warn("The default value for 'scale' is set to False "
@@ -390,16 +767,16 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         else:
             n_shapelets_per_size = self.n_shapelets_per_size
         total_n_shp = sum(n_shapelets_per_size.values())
-        shapelets = numpy.empty((total_n_shp, ), dtype=object)
+        shapelets = np.empty((total_n_shp, ), dtype=object)
         idx = 0
         for i, shp_sz in enumerate(sorted(n_shapelets_per_size.keys())):
             n_shp = n_shapelets_per_size[shp_sz]
             for idx_shp in range(idx, idx + n_shp):
-                shapelets[idx_shp] = numpy.zeros((shp_sz, self.d_))
+                shapelets[idx_shp] = np.zeros((shp_sz, self.d_))
             for di in range(self.d_):
                 layer = self.model_.get_layer("shapelets_%d_%d" % (i, di))
                 for inc, shp in enumerate(layer.get_weights()[0]):
-                    shapelets[idx + inc][:, di] = shp
+                    shapelets[idx + inc][:, di] = shp[:, di]
             idx += n_shp
         assert idx == total_n_shp
         return shapelets
@@ -427,104 +804,70 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         shp_sz = max(n_shapelets_per_size.keys())
         non_formatted_shapelets = self.shapelets_
         d = non_formatted_shapelets[0].shape[1]
-        shapelets = numpy.zeros((total_n_shp, shp_sz, d)) + numpy.nan
+        shapelets = np.zeros((total_n_shp, shp_sz, d)) + np.nan
         for i in range(total_n_shp):
             sz = non_formatted_shapelets[i].shape[0]
             shapelets[i, :sz, :] = non_formatted_shapelets[i]
         return shapelets
 
-    def compute_shapelet_similarity_loss(self, X, lambda_=0.1):
+    def fit(self, X, y):
         """
-        Compute similarity loss between shapelets and input subsequences using GRL.
+        Learn time-series shapelets with position and dilation tracking.
+        """
+       
         
-        Parameters
-        ----------
-        X : tf.Tensor
-            Input time series tensor (batch, steps, features).
-        lambda_ : float
-            Gradient reversal strength.
-        
-        Returns
-        -------
-        loss : tf.Tensor
-            Similarity loss.
-        """
-        shapelet_outputs = self.transformer_model_.predict(X, verbose=0)
-        grl_layer = GradientReversalLayer(lambda_=lambda_)
-        reversed_output = grl_layer(shapelet_outputs)
-        loss = tf.reduce_mean(tf.square(X - reversed_output))  # MSE between input and shapelet
-        return loss
-    
-    def fit(self, X, y, lambda_=0.1):
-        """
-        Learn time-series shapelets with GRL-based similarity constraint.
-
-        Parameters
-        ----------
-        X : array-like of shape=(n_ts, sz, d)
-            Time series dataset.
-        y : array-like of shape=(n_ts, )
-            Time series labels.
-        lambda_ : float
-            Gradient reversal strength for shapelet similarity loss.
-        """
         # 데이터 전처리
         X, y = check_X_y(X, y, allow_nd=True, force_all_finite=False)
         X = self._preprocess_series(X)
         X = check_dims(X)
         self._check_series_length(X)
 
-        if self.random_state is not None:
-            tf.keras.utils.set_random_seed(seed=self.random_state)
-
         n_ts, sz, d = X.shape
         self._X_fit_dims = X.shape
+        self.d_ = d  # 데이터 차원 수 저장
 
-        y_ = self._preprocess_labels(y)
-        n_labels = len(self.classes_)
-
-        # Shapelet 크기 및 개수 설정
+        # n_shapelets_per_size_ 초기화
         if self.n_shapelets_per_size is None:
-            sizes = grabocka_params_to_shapelet_size_dict(
-                n_ts, self._min_sz_fit, n_labels, self.shapelet_length, self.total_lengths)
-            self.n_shapelets_per_size_ = sizes
+            self.n_shapelets_per_size_ = grabocka_params_to_shapelet_size_dict(
+                n_ts=n_ts, ts_sz=sz, n_classes=len(np.unique(y)),
+                l=self.shapelet_length, r=self.total_lengths
+            )
         else:
             self.n_shapelets_per_size_ = self.n_shapelets_per_size
 
-        # 모델 구조 설정
-        self._set_model_layers(X=X, ts_sz=sz, d=d, n_classes=n_labels)
+        # Shapelet 초기화 및 위치 정보 추출
+        initialized_shapelets, self._dilations, self._positions = [], [], []
+        for shp_len, n_shp in self.n_shapelets_per_size_.items():
+            shapelets, dilations, positions = random_dilated_shapelet_initializer(
+                X, n_shp, shp_len, dilation_range=(1, 5), alpha_similarity=self.alpha_similarity  # alpha_similarity 전달
+            )
+            initialized_shapelets.extend(shapelets)
+            self._dilations.extend(dilations)
+            self._positions.extend(positions)
+        
+        
+        # for shp_len, n_shp in self.n_shapelets_per_size_.items():
+        #     shapelets, dilations, positions = random_dilated_shapelet_initializer(
+        #         X, n_shp, shp_len, dilation_range=(1, 5)
+        #     )
+        #     initialized_shapelets.extend(shapelets)
+        #     self._dilations.extend(dilations)
+        #     self._positions.extend(positions)
+
+        # 패딩된 shapelets로 변환 후 저장
+        self._shapelets = pad_shapelets(initialized_shapelets)
+
+        # 모델 학습을 위해 레이블 전처리 및 모델 설정
+        y_ = self._preprocess_labels(y)
+        self._set_model_layers(X=X, ts_sz=sz, d=d, n_classes=len(self.classes_))
         self._set_weights_false_conv(d=d)
 
-        # 옵티마이저 설정
-        optimizer = tf.keras.optimizers.Adam()
-
-        # 학습 루프
-        for epoch in range(self.max_iter):
-            with tf.GradientTape() as tape:
-                # 모델 예측 (Forward Pass)
-                y_pred = self.model_([X[:, :, di].reshape((n_ts, sz, 1)) for di in range(d)])
-                
-                # 분류 손실 (Categorical Cross-Entropy)
-                classification_loss = tf.reduce_mean(
-                    tf.keras.losses.categorical_crossentropy(y_, y_pred))
-                
-                # GRL 기반 shapelet 유사도 손실
-                grl_loss = self.compute_shapelet_similarity_loss(X, lambda_=lambda_)
-                
-                # 총 손실 = 분류 손실 + shapelet 유사도 손실
-                total_loss = classification_loss + grl_loss
-
-            # Backward Pass 및 가중치 업데이트
-            grads = tape.gradient(total_loss, self.model_.trainable_weights)
-            optimizer.apply_gradients(zip(grads, self.model_.trainable_weights))
-
-            # 손실 출력
-            if self.verbose > 0 and epoch % 10 == 0:
-                print(f"Epoch {epoch}, Total Loss: {total_loss.numpy():.4f}, "
-                    f"Classification Loss: {classification_loss.numpy():.4f}, "
-                    f"GRL Loss: {grl_loss.numpy():.4f}")
-
-        # 학습된 모델 객체 반환
+        # 모델 학습 시작
+        h = self.model_.fit(
+            [X[:, :, di].reshape((n_ts, sz, 1)) for di in range(d)], y_,
+            batch_size=self.batch_size, epochs=self.max_iter, verbose=self.verbose
+        )
+        self.history_ = h.history
         return self
 
     def predict(self, X):
@@ -550,7 +893,7 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         self._check_series_length(X)
 
         y_ind = self.predict_proba(X).argmax(axis=1)
-        y_label = numpy.array(
+        y_label = np.array(
             [self.classes_[ind] for ind in y_ind]
         )
         return y_label
@@ -582,7 +925,7 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         )
 
         if categorical_preds.shape[1] == 1 and len(self.classes_) == 2:
-            categorical_preds = numpy.hstack((1 - categorical_preds,
+            categorical_preds = np.hstack((1 - categorical_preds,
                                               categorical_preds))
 
         return categorical_preds
@@ -630,15 +973,15 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         Examples
         --------
         >>> from tslearn.generators import random_walk_blobs
-        >>> X = numpy.zeros((3, 10, 1))
-        >>> X[0, 4:7, 0] = numpy.array([1, 2, 3])
+        >>> X = np.zeros((3, 10, 1))
+        >>> X[0, 4:7, 0] = np.array([1, 2, 3])
         >>> y = [1, 0, 0]
         >>> # Data is all zeros except a motif 1-2-3 in the first time series
         >>> clf = LearningShapelets(n_shapelets_per_size={3: 1}, max_iter=0,
         ...                     verbose=0)
         >>> _ = clf.fit(X, y)
         >>> weights_shapelet = [
-        ...     numpy.array([[1, 2, 3]])
+        ...     np.array([[1, 2, 3]])
         ... ]
         >>> clf.set_weights(weights_shapelet, layer_name="shapelets_0_0")
         >>> clf.locate(X)
@@ -660,39 +1003,6 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         )
         return locations.astype(int)
 
-    def locate_with_instances(self, X):
-        """시계열 인스턴스 ID와 shapelet 위치 반환
-
-        Parameters
-        ----------
-        X : array-like of shape=(n_ts, sz, d)
-            Time series dataset.
-
-        Returns
-        -------
-        positions : list of tuples
-            각 shapelet이 어느 시계열과 인덱스에 위치하는지 저장된 리스트.
-            예: [(instance_id, start_index), ...]
-        """
-        check_is_fitted(self, '_X_fit_dims')
-        X = check_array(X, allow_nd=True, force_all_finite=False)
-        X = self._preprocess_series(X)
-        X = check_dims(X, X_fit_dims=self._X_fit_dims, check_n_features_only=True)
-        self._check_series_length(X)
-
-        n_ts, sz, d = X.shape
-        locations = self.locator_model_.predict(
-            [X[:, :, di].reshape((n_ts, sz, 1)) for di in range(self.d_)],
-            batch_size=self.batch_size, verbose=self.verbose
-        ).astype(int)
-
-        # 시계열 인스턴스와 shapelet 위치를 함께 기록
-        positions = []
-        for instance_id in range(n_ts):
-            for shapelet_idx, start_index in enumerate(locations[instance_id]):
-                positions.append((instance_id, shapelet_idx, start_index))
-        return positions
-    
     def _check_series_length(self, X):
         """Ensures that time series in X matches the following requirements:
         
@@ -700,7 +1010,7 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         - (at predict time) their length is lower than the maximum allowed 
         length, as set by self.max_size
         """
-        sizes = numpy.array([ts_size(Xi) for Xi in X])
+        sizes = np.array([ts_size(Xi) for Xi in X])
         self._min_sz_fit = sizes.min()
 
         if self.n_shapelets_per_size is not None:
@@ -739,9 +1049,9 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
                     "Cannot feed model with series of length {} "
                     "max_size is {}".format(X.shape[1], self.max_size)
                 )
-            X_ = numpy.zeros((X.shape[0], self.max_size, X.shape[2]))
+            X_ = np.zeros((X.shape[0], self.max_size, X.shape[2]))
             X_[:, :X.shape[1]] = X
-            X_[:, X.shape[1]:] = numpy.nan
+            X_[:, X.shape[1]:] = np.nan
             return X_
         else:
             return X
@@ -752,13 +1062,13 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         if n_labels == 1:
             raise ValueError("Classifier can't train when only one class "
                              "is present.")
-        if self.classes_.dtype in [numpy.int32, numpy.int64]:
+        if self.classes_.dtype in [np.int32, np.int64]:
             self.label_to_ind_ = {int(lab): ind
                                   for ind, lab in enumerate(self.classes_)}
         else:
             self.label_to_ind_ = {lab: ind
                                   for ind, lab in enumerate(self.classes_)}
-        y_ind = numpy.array(
+        y_ind = np.array(
             [self.label_to_ind_[lab] for lab in y]
         )
         y_ = to_categorical(y_ind)
@@ -799,15 +1109,18 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         for i, sz in enumerate(shapelet_sizes):
             for di in range(d):
                 layer = self.model_.get_layer("false_conv_%d_%d" % (i, di))
-                layer.set_weights([numpy.eye(sz).reshape((sz, 1, sz))])
+                layer.set_weights([np.eye(sz).reshape((sz, 1, sz))])
 
     def _set_model_layers(self, X, ts_sz, d, n_classes):
         inputs = [Input(shape=(self.max_size, 1),
                         name="input_%d" % di)
-                  for di in range(d)]
-        shapelet_sizes = sorted(self.n_shapelets_per_size_.keys())
+                for di in range(d)]
+        
+        # 기존 속성 사용
+        shapelet_sizes = sorted(self.n_shapelets_per_size.keys())  
         pool_layers = []
-        for i, sz in enumerate(sorted(shapelet_sizes)):
+        
+        for i, sz in enumerate(shapelet_sizes):
             transformer_layers = [
                 Conv1D(
                     filters=sz, kernel_size=sz,
@@ -817,7 +1130,8 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
             ]
             shapelet_layers = [
                 LocalSquaredDistanceLayer(
-                    self.n_shapelets_per_size_[sz], X=X,
+                    n_shapelets=self.n_shapelets_per_size[sz],
+                    kernel_size=sz,
                     name="shapelets_%d_%d" % (i, di)
                 )(transformer_layers[di]) for di in range(d)
             ]
@@ -827,8 +1141,16 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
             else:
                 sum_shap = add(shapelet_layers)
 
+            # 차원 유지 (3차원 형태로 유지)
+            sum_shap = Lambda(lambda x: tf.reduce_min(x, axis=-1, keepdims=True))(sum_shap)
+
+            # tf.squeeze를 사용하지 않고 reshape를 통해 차원 명시적으로 수정
+            sum_shap = Lambda(lambda x: tf.reshape(x, (-1, x.shape[1], 1)))(sum_shap)
+            # GlobalMinPooling1D 호출
             gp = GlobalMinPooling1D(name="min_pooling_%d" % i)(sum_shap)
             pool_layers.append(gp)
+
+                
         if len(shapelet_sizes) > 1:
             concatenated_features = concatenate(pool_layers)
         else:
@@ -851,9 +1173,18 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
                         kernel_regularizer=regularizer,
                         name="classification")(concatenated_features)
         self.model_ = Model(inputs=inputs, outputs=outputs)
-        self.model_.compile(loss=loss,
+        # self.model_.compile(loss=lambda y_true, 
+        #                     y_pred: shape_matching_loss(y_true, y_pred, self.shapelets_, beta=0.1),
+        #                     optimizer=self.optimizer,
+        #                     metrics=metrics
+        #                 )
+        
+        self.model_.compile(loss=lambda y_true, 
+                            y_pred: shape_matching_loss(y_true, y_pred, self.shapelets_, beta=self.beta),
                             optimizer=self.optimizer,
-                            metrics=metrics)
+                            metrics=metrics
+                        )
+        
         self._build_auxiliary_models()
 
     def get_weights(self, layer_name=None):
@@ -920,7 +1251,7 @@ class LearningShapelets(ClassifierMixin, TransformerMixin,
         ...                     verbose=0)
         >>> _ = clf.fit(X, y)
         >>> weights_shapelet = [
-        ...     numpy.array([[1, 2, 3]])
+        ...     np.array([[1, 2, 3]])
         ... ]
         >>> clf.set_weights(weights_shapelet, layer_name="shapelets_0_0")
         >>> clf.shapelets_as_time_series_
